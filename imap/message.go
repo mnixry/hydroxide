@@ -2,12 +2,13 @@ package imap
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-message"
@@ -68,7 +69,7 @@ func imapAddressList(addresses []*protonmail.MessageAddress) []*imap.Address {
 
 func fetchEnvelope(msg *protonmail.Message) *imap.Envelope {
 	return &imap.Envelope{
-		Date:    time.Unix(msg.Time, 0),
+		Date:    msg.Time.Time(),
 		Subject: msg.Subject,
 		From:    []*imap.Address{imapAddress(msg.Sender)},
 		// TODO: Sender
@@ -79,6 +80,11 @@ func fetchEnvelope(msg *protonmail.Message) *imap.Envelope {
 		// TODO: InReplyTo
 		MessageId: messageID(msg),
 	}
+}
+
+func msgBoundary(msg *protonmail.Message) string {
+	h := sha1.Sum([]byte(msg.ID))
+	return hex.EncodeToString(h[:])
 }
 
 func hasLabel(msg *protonmail.Message, labelID string) bool {
@@ -140,7 +146,7 @@ func (mbox *mailbox) fetchBodyStructure(msg *protonmail.Message, extended bool) 
 	return &imap.BodyStructure{
 		MIMEType:    "multipart",
 		MIMESubType: "mixed",
-		// TODO: Params: map[string]string{"boundary": ...},
+		Params:      map[string]string{"boundary": msgBoundary(msg)},
 		// TODO: Size
 		Parts:    parts,
 		Extended: extended,
@@ -175,7 +181,7 @@ func (mbox *mailbox) attachmentBody(att *protonmail.Attachment) (io.Reader, erro
 func inlineHeader(msg *protonmail.Message) message.Header {
 	var h mail.InlineHeader
 	if msg.MIMEType != "" {
-		h.SetContentType(msg.MIMEType, nil)
+		h.SetContentType(msg.MIMEType, map[string]string{"charset": "utf-8"})
 	} else {
 		log.Println("Sending an inline header without its proper MIME type")
 	}
@@ -210,9 +216,11 @@ func mailAddressList(addresses []*protonmail.MessageAddress) []*mail.Address {
 }
 
 func messageHeader(msg *protonmail.Message) message.Header {
+	typeParams := map[string]string{"boundary": msgBoundary(msg)}
+
 	var h mail.Header
-	h.SetContentType("multipart/mixed", nil)
-	h.SetDate(time.Unix(msg.Time, 0))
+	h.SetContentType("multipart/mixed", typeParams)
+	h.SetDate(msg.Time.Time())
 	h.SetSubject(msg.Subject)
 	h.SetAddressList("From", []*mail.Address{mailAddress(msg.Sender)})
 	if len(msg.ReplyTos) > 0 {
@@ -228,7 +236,7 @@ func messageHeader(msg *protonmail.Message) message.Header {
 		h.SetAddressList("Bcc", mailAddressList(msg.BCCList))
 	}
 	// TODO: In-Reply-To
-	h.Set("Message-Id", messageID(msg))
+	h.Set("Message-Id", fmt.Sprintf("<%s>", messageID(msg)))
 	return h.Header
 }
 

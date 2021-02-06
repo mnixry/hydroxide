@@ -62,7 +62,7 @@ func (mbox *mailbox) Info() (*imap.MailboxInfo, error) {
 func (mbox *mailbox) Status(items []imap.StatusItem) (*imap.MailboxStatus, error) {
 	mbox.u.Lock()
 	flags := []string{imap.SeenFlag, imap.DeletedFlag}
-	permFlags := []string{imap.SeenFlag}
+	permFlags := []string{imap.SeenFlag, imap.DeletedFlag}
 	for _, flag := range mbox.u.flags {
 		flags = append(flags, flag)
 		permFlags = append(permFlags, flag)
@@ -234,7 +234,7 @@ func (mbox *mailbox) fetchMessage(isUid bool, id uint32, items []imap.FetchItem)
 		case imap.FetchFlags:
 			fetched.Flags = mbox.fetchFlags(msg)
 		case imap.FetchInternalDate:
-			fetched.InternalDate = time.Unix(msg.Time, 0)
+			fetched.InternalDate = msg.Time.Time()
 		case imap.FetchRFC822Size:
 			fetched.Size = uint32(msg.Size)
 		case imap.FetchUid:
@@ -342,7 +342,7 @@ func (mbox *mailbox) SearchMessages(isUID bool, c *imap.SearchCriteria) ([]uint3
 			}
 		}
 
-		date := time.Unix(msg.Time, 0).Round(24 * time.Hour)
+		date := msg.Time.Time().Round(24 * time.Hour)
 		if !c.Since.IsZero() && !date.After(c.Since) {
 			return nil
 		}
@@ -550,8 +550,14 @@ func (mbox *mailbox) Expunge() error {
 		return err
 	}
 
-	apiIDs := make([]string, 0, len(mbox.deleted))
 	mbox.Lock()
+	if len(mbox.deleted) == 0 {
+		mbox.Unlock()
+		return nil // Nothing to do
+	}
+
+	apiIDs := make([]string, 0, len(mbox.deleted))
+
 	for apiID := range mbox.deleted {
 		apiIDs = append(apiIDs, apiID)
 	}

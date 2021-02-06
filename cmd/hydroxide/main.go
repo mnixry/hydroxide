@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	imapmove "github.com/emersion/go-imap-move"
 	imapspacialuse "github.com/emersion/go-imap-specialuse"
 	imapserver "github.com/emersion/go-imap/server"
+	"github.com/emersion/go-mbox"
 	"github.com/emersion/go-smtp"
 	"github.com/howeyc/gopass"
 	"golang.org/x/crypto/openpgp"
@@ -20,6 +22,7 @@ import (
 	"github.com/emersion/hydroxide/auth"
 	"github.com/emersion/hydroxide/carddav"
 	"github.com/emersion/hydroxide/events"
+	"github.com/emersion/hydroxide/exports"
 	imapbackend "github.com/emersion/hydroxide/imap"
 	"github.com/emersion/hydroxide/imports"
 	"github.com/emersion/hydroxide/protonmail"
@@ -109,18 +112,28 @@ func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager
 	return s.ListenAndServe()
 }
 
-const usage = `usage: hydroxide <flags> <command>
+func isMbox(br *bufio.Reader) (bool, error) {
+	prefix := []byte("From ")
+	b, err := br.Peek(len(prefix))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(b, prefix), nil
+}
+
+const usage = `usage: hydroxide [options...] <command>
 Commands:
 	auth <username>		Login to ProtonMail via hydroxide
 	carddav			Run hydroxide as a CardDAV server
 	export-secret-keys <username> Export secret keys
 	imap			Run hydroxide as an IMAP server
 	import-messages <username> <file>	Import messages
+	export-messages [options...] <username>	Export messages
 	serve			Run all servers
 	smtp			Run hydroxide as an SMTP server
 	status			View hydroxide status
 
-Flags:
+Global options:
 	-debug
 		Enable debug logs
 	-smtp-host example.com
@@ -151,6 +164,7 @@ func main() {
 	authCmd := flag.NewFlagSet("auth", flag.ExitOnError)
 	exportSecretKeysCmd := flag.NewFlagSet("export-secret-keys", flag.ExitOnError)
 	importMessagesCmd := flag.NewFlagSet("import-messages", flag.ExitOnError)
+	exportMessagesCmd := flag.NewFlagSet("export-messages", flag.ExitOnError)
 
 	flag.Parse()
 
@@ -304,8 +318,6 @@ func main() {
 			log.Fatal(err)
 		}
 	case "import-messages":
-		// TODO: support for mbox
-
 		importMessagesCmd.Parse(flag.Args()[1:])
 		username := importMessagesCmd.Arg(0)
 		archivePath := importMessagesCmd.Arg(1)
@@ -332,7 +344,65 @@ func main() {
 			log.Fatal(err)
 		}
 
-		if err := imports.ImportMessage(c, f); err != nil {
+		br := bufio.NewReader(f)
+		if ok, err := isMbox(br); err != nil {
+			log.Fatal(err)
+		} else if ok {
+			mr := mbox.NewReader(br)
+			for {
+				r, err := mr.NextMessage()
+				if err == io.EOF {
+					break
+				} else if err != nil {
+					log.Fatal(err)
+				}
+				if err := imports.ImportMessage(c, r); err != nil {
+					log.Fatal(err)
+				}
+			}
+		} else {
+			if err := imports.ImportMessage(c, br); err != nil {
+				log.Fatal(err)
+			}
+		}
+	case "export-messages":
+		// TODO: allow specifying multiple IDs
+		var convID, msgID string
+		exportMessagesCmd.StringVar(&convID, "conversation-id", "", "conversation ID")
+		exportMessagesCmd.StringVar(&msgID, "message-id", "", "message ID")
+		exportMessagesCmd.Parse(flag.Args()[1:])
+		username := exportMessagesCmd.Arg(0)
+		if (convID == "" && msgID == "") || username == "" {
+			log.Fatal("usage: hydroxide export-messages [-conversation-id <id>] [-message-id <id>] <username>")
+		}
+
+		var bridgePassword string
+		fmt.Fprintf(os.Stderr, "Bridge password: ")
+		if pass, err := gopass.GetPasswd(); err != nil {
+			log.Fatal(err)
+		} else {
+			bridgePassword = string(pass)
+		}
+
+		c, privateKeys, err := auth.NewManager(newClient).Auth(username, bridgePassword)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		mboxWriter := mbox.NewWriter(os.Stdout)
+
+		if convID != "" {
+			if err := exports.ExportConversationMbox(c, privateKeys, mboxWriter, convID); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if msgID != "" {
+			if err := exports.ExportMessageMbox(c, privateKeys, mboxWriter, msgID); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		if err := mboxWriter.Close(); err != nil {
 			log.Fatal(err)
 		}
 	case "smtp":
