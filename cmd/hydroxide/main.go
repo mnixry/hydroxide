@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -10,17 +11,18 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	imapmove "github.com/emersion/go-imap-move"
 	imapspacialuse "github.com/emersion/go-imap-specialuse"
 	imapserver "github.com/emersion/go-imap/server"
 	"github.com/emersion/go-mbox"
 	"github.com/emersion/go-smtp"
 	"github.com/howeyc/gopass"
-	"golang.org/x/crypto/openpgp"
-	"golang.org/x/crypto/openpgp/armor"
 
 	"github.com/emersion/hydroxide/auth"
 	"github.com/emersion/hydroxide/carddav"
+	"github.com/emersion/hydroxide/config"
 	"github.com/emersion/hydroxide/events"
 	"github.com/emersion/hydroxide/exports"
 	imapbackend "github.com/emersion/hydroxide/imap"
@@ -39,25 +41,32 @@ func newClient() *protonmail.Client {
 	}
 }
 
-func listenAndServeSMTP(addr string, debug bool, authManager *auth.Manager) error {
+func listenAndServeSMTP(addr string, debug bool, authManager *auth.Manager, tlsConfig *tls.Config) error {
 	be := smtpbackend.New(authManager)
 	s := smtp.NewServer(be)
 	s.Addr = addr
-	s.Domain = "localhost"     // TODO: make this configurable
-	s.AllowInsecureAuth = true // TODO: remove this
+	s.Domain = "localhost" // TODO: make this configurable
+	s.AllowInsecureAuth = tlsConfig == nil
+	s.TLSConfig = tlsConfig
 	if debug {
 		s.Debug = os.Stdout
+	}
+
+	if s.TLSConfig != nil {
+		log.Println("SMTP server listening with TLS on", s.Addr)
+		return s.ListenAndServeTLS()
 	}
 
 	log.Println("SMTP server listening on", s.Addr)
 	return s.ListenAndServe()
 }
 
-func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, eventsManager *events.Manager) error {
+func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
 	be := imapbackend.New(authManager, eventsManager)
 	s := imapserver.New(be)
 	s.Addr = addr
-	s.AllowInsecureAuth = true // TODO: remove this
+	s.AllowInsecureAuth = tlsConfig == nil
+	s.TLSConfig = tlsConfig
 	if debug {
 		s.Debug = os.Stdout
 	}
@@ -65,15 +74,21 @@ func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, even
 	s.Enable(imapspacialuse.NewExtension())
 	s.Enable(imapmove.NewExtension())
 
+	if s.TLSConfig != nil {
+		log.Println("IMAP server listening with TLS on", s.Addr)
+		return s.ListenAndServeTLS()
+	}
+
 	log.Println("IMAP server listening on", s.Addr)
 	return s.ListenAndServe()
 }
 
-func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager *events.Manager) error {
+func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
 	handlers := make(map[string]http.Handler)
 
 	s := &http.Server{
-		Addr: addr,
+		Addr:      addr,
+		TLSConfig: tlsConfig,
 		Handler: http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
 			resp.Header().Set("WWW-Authenticate", "Basic")
 
@@ -106,6 +121,11 @@ func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager
 
 			h.ServeHTTP(resp, req)
 		}),
+	}
+
+	if s.TLSConfig != nil {
+		log.Println("CardDAV server listening with TLS on", s.Addr)
+		return s.ListenAndServeTLS("", "")
 	}
 
 	log.Println("CardDAV server listening on", s.Addr)
@@ -147,26 +167,54 @@ Global options:
 	-imap-port example.com
 		IMAP port on which hydroxide listens, defaults to 1143
 	-carddav-port example.com
-		CardDAV port on which hydroxide listens, defaults to 8080`
+		CardDAV port on which hydroxide listens, defaults to 8080
+	-disable-imap
+		Disable IMAP for hydroxide serve
+	-disable-smtp
+		Disable SMTP for hydroxide serve
+	-disable-carddav
+		Disable CardDAV for hydroxide serve
+	-tls-cert /path/to/cert.pem
+		Path to the certificate to use for incoming connections (Optional)
+	-tls-key /path/to/key.pem
+		Path to the certificate key to use for incoming connections (Optional)
+	-tls-client-ca /path/to/ca.pem
+		If set, clients must provide a certificate signed by the given CA (Optional)`
 
 func main() {
 	flag.BoolVar(&debug, "debug", false, "Enable debug logs")
 
 	smtpHost := flag.String("smtp-host", "127.0.0.1", "Allowed SMTP email hostname on which hydroxide listens, defaults to 127.0.0.1")
 	smtpPort := flag.String("smtp-port", "1025", "SMTP port on which hydroxide listens, defaults to 1025")
+	disableSMTP := flag.Bool("disable-smtp", false, "Disable SMTP for hydroxide serve")
 
 	imapHost := flag.String("imap-host", "127.0.0.1", "Allowed IMAP email hostname on which hydroxide listens, defaults to 127.0.0.1")
 	imapPort := flag.String("imap-port", "1143", "IMAP port on which hydroxide listens, defaults to 1143")
+	disableIMAP := flag.Bool("disable-imap", false, "Disable IMAP for hydroxide serve")
 
 	carddavHost := flag.String("carddav-host", "127.0.0.1", "Allowed CardDAV email hostname on which hydroxide listens, defaults to 127.0.0.1")
 	carddavPort := flag.String("carddav-port", "8080", "CardDAV port on which hydroxide listens, defaults to 8080")
+	disableCardDAV := flag.Bool("disable-carddav", false, "Disable CardDAV for hydroxide serve")
+
+	tlsCert := flag.String("tls-cert", "", "Path to the certificate to use for incoming connections")
+	tlsCertKey := flag.String("tls-key", "", "Path to the certificate key to use for incoming connections")
+	tlsClientCA := flag.String("tls-client-ca", "", "If set, clients must provide a certificate signed by the given CA")
 
 	authCmd := flag.NewFlagSet("auth", flag.ExitOnError)
 	exportSecretKeysCmd := flag.NewFlagSet("export-secret-keys", flag.ExitOnError)
 	importMessagesCmd := flag.NewFlagSet("import-messages", flag.ExitOnError)
 	exportMessagesCmd := flag.NewFlagSet("export-messages", flag.ExitOnError)
 
+	flag.Usage = func() {
+		fmt.Println(usage)
+	}
+
 	flag.Parse()
+
+	tlsConfig, err := config.TLS(*tlsCert, *tlsCertKey, *tlsClientCA)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	cmd := flag.Arg(0)
 	switch cmd {
@@ -408,17 +456,17 @@ func main() {
 	case "smtp":
 		addr := *smtpHost + ":" + *smtpPort
 		authManager := auth.NewManager(newClient)
-		log.Fatal(listenAndServeSMTP(addr, debug, authManager))
+		log.Fatal(listenAndServeSMTP(addr, debug, authManager, tlsConfig))
 	case "imap":
 		addr := *imapHost + ":" + *imapPort
 		authManager := auth.NewManager(newClient)
 		eventsManager := events.NewManager()
-		log.Fatal(listenAndServeIMAP(addr, debug, authManager, eventsManager))
+		log.Fatal(listenAndServeIMAP(addr, debug, authManager, eventsManager, tlsConfig))
 	case "carddav":
 		addr := *carddavHost + ":" + *carddavPort
 		authManager := auth.NewManager(newClient)
 		eventsManager := events.NewManager()
-		log.Fatal(listenAndServeCardDAV(addr, authManager, eventsManager))
+		log.Fatal(listenAndServeCardDAV(addr, authManager, eventsManager, tlsConfig))
 	case "serve":
 		smtpAddr := *smtpHost + ":" + *smtpPort
 		imapAddr := *imapHost + ":" + *imapPort
@@ -428,18 +476,24 @@ func main() {
 		eventsManager := events.NewManager()
 
 		done := make(chan error, 3)
-		go func() {
-			done <- listenAndServeSMTP(smtpAddr, debug, authManager)
-		}()
-		go func() {
-			done <- listenAndServeIMAP(imapAddr, debug, authManager, eventsManager)
-		}()
-		go func() {
-			done <- listenAndServeCardDAV(carddavAddr, authManager, eventsManager)
-		}()
+		if !*disableSMTP {
+			go func() {
+				done <- listenAndServeSMTP(smtpAddr, debug, authManager, tlsConfig)
+			}()
+		}
+		if !*disableIMAP {
+			go func() {
+				done <- listenAndServeIMAP(imapAddr, debug, authManager, eventsManager, tlsConfig)
+			}()
+		}
+		if !*disableCardDAV {
+			go func() {
+				done <- listenAndServeCardDAV(carddavAddr, authManager, eventsManager, tlsConfig)
+			}()
+		}
 		log.Fatal(<-done)
 	default:
-		log.Println(usage)
+		fmt.Println(usage)
 		if cmd != "help" {
 			log.Fatal("Unrecognized command")
 		}
